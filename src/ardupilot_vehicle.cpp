@@ -727,12 +727,12 @@ Ardupilot_vehicle::Report_home_location(double lat, double lon, double alt)
 
     if (Is_home_position_valid()) {
         VEHICLE_LOG_INF(*this,
-            "Got home position: x=%f, y=%f, z=%f. Setting altitude origin.",
+            "Got home position: x=%f, y=%f, z=%f.",
             lat * 180 / M_PI, lon * 180 / M_PI, alt);
         t_home_latitude->Set_value(lat);
         t_home_longitude->Set_value(lon);
         t_home_altitude_amsl->Set_value(alt);
-        Set_altitude_origin(alt);   // this calls Commit_to_ucs.
+        //Set_altitude_origin(alt);   // this calls Commit_to_ucs.
     }
 }
 
@@ -797,12 +797,16 @@ Ardupilot_vehicle::Vehicle_command_act::Try()
         Send_message(*(cmd_messages.front()));
 
         auto cmd = cmd_messages.front();
+        VEHICLE_LOG_DBG(vehicle, "Sending to vehicle: %s", (*(cmd_messages.front())).Dump().c_str());
         if (cmd->Get_id() == mavlink::apm::MESSAGE_ID::FENCE_POINT) {
             Schedule_verify_timer();
+        } else if (cmd->Get_id() == mavlink::MESSAGE_ID::SET_POSITION_TARGET_LOCAL_NED) {
+            // there will be no ack from this cmd so jump to next cmd
+            Send_next_command();
         } else {
             Schedule_timer();
         }
-        VEHICLE_LOG_DBG(vehicle, "Sending to vehicle: %s", (*(cmd_messages.front())).Dump().c_str());
+
     } else {
         // Command list is empty, nothing to do.
         Disable("Command list empty");
@@ -1071,8 +1075,13 @@ Ardupilot_vehicle::Vehicle_command_act::Send_next_command()
             Schedule_timer();
         } else {
             Send_message(*(cmd_messages.front()));
-            Schedule_timer();
             VEHICLE_LOG_DBG(vehicle, "Sending to vehicle: %s", (*(cmd_messages.front())).Dump().c_str());
+            if (cmd->Get_id() == mavlink::MESSAGE_ID::SET_POSITION_TARGET_LOCAL_NED) {
+                // there will be no ack from this cmd so jump to next cmd
+                Send_next_command();
+            } else {
+                Schedule_timer();
+            }
         }
 
     } else {
@@ -1327,7 +1336,7 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
         } else if (cmd == vehicle.c_resume) {
             Process_resume();
         } else if (cmd == vehicle.c_pause) {
-            Process_pause();
+            Process_pause(params);
         } else if (cmd == vehicle.c_auto) {
             Process_auto();
         } else if (cmd == vehicle.c_manual) {
@@ -1939,8 +1948,9 @@ Ardupilot_vehicle::Vehicle_command_act::Process_disarm()
 }
 
 void
-Ardupilot_vehicle::Vehicle_command_act::Process_pause()
+Ardupilot_vehicle::Vehicle_command_act::Process_pause(const ugcs::vsm::Property_list& params)
 {
+    VEHICLE_LOG_INF(vehicle, "Pausing mission.");
     Stop_camera_series();
     // If vehicle is in guided mode already then
     // briefly move into manual to reset current guided WP and then
@@ -1960,6 +1970,30 @@ Ardupilot_vehicle::Vehicle_command_act::Process_pause()
     (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
     (*cmd_set_mode)->custom_mode = Get_custom_guided_mode();
     cmd_messages.emplace_back(cmd_set_mode);
+
+    float add_altitude = 0;
+    if (params.Get_value("additional_altitude", add_altitude)) {
+        if (add_altitude > 0) {
+            VEHICLE_LOG_INF(vehicle, "Climbing additional %f meters", add_altitude);
+            mavlink::Pld_set_position_target_local_ned::Ptr cmd_set_position =
+                    mavlink::Pld_set_position_target_local_ned::Create();
+            Fill_target_ids(*cmd_set_position);
+            // Control UAV with position offsets
+            // this is NED frame, so to climb we need to
+            // set negftive z value
+            (*cmd_set_position)->coordinate_frame = mavlink::MAV_FRAME::MAV_FRAME_BODY_NED;
+            // position mask
+            (*cmd_set_position)->type_mask = ~((1 << 0) | (1 << 1) | (1 << 2));
+            // move only vertical
+            (*cmd_set_position)->x = 0;
+            (*cmd_set_position)->y = 0;
+            (*cmd_set_position)->z = -add_altitude;
+
+            cmd_messages.emplace_back(cmd_set_position);
+        } else if (add_altitude < 0) {
+            VEHICLE_LOG_INF(vehicle, "Additional altitude parameter was negative (%f). Ignored.", add_altitude);
+        }
+   }
 }
 
 void
@@ -2413,6 +2447,13 @@ Ardupilot_vehicle::Task_upload::Preprocess_mission(const proto::Device_command& 
     // Prepare_takeoff_mission uses this feature.
     current_route_command_index = 0;
 
+
+    // previous move cmd checkers.
+    // need to detect incorrect WPs sequences
+    // when flying with rangefinder (see algo below)
+    bool prev_cmd_move_spline_rangefinder = false;
+    bool prev_cmd_move_spline_relative_amsl = false;
+
     for (int i = 0; i < vsm_cmd.sub_commands_size(); i++) {
         auto vsm_scmd = vsm_cmd.sub_commands(i);
         auto cmd = vehicle.Get_command(vsm_scmd.command_id());
@@ -2425,7 +2466,50 @@ Ardupilot_vehicle::Task_upload::Preprocess_mission(const proto::Device_command& 
             }
             VEHICLE_LOG_INF(vehicle, "ROUTE item %s", vehicle.Dump_command(vsm_scmd).c_str());
             vehicle.current_command_map.Set_current_command(current_route_command_index);
+
             auto params = cmd->Build_parameter_list(vsm_scmd);
+            // check terrain following possibility
+            if (cmd == vehicle.c_move) {
+                bool is_terrain_following = false;
+                if (params.Get_value("follow_terrain", is_terrain_following)) {
+                    if (is_terrain_following && !vehicle.Is_rangefinder_healthy()) {
+                        VSM_EXCEPTION(Invalid_param_exception, "FOLLOW TERRAIN is not available on UAV. No RANGEFINDER "
+                                                               "is healthy at this moment.");
+                    }
+                }
+
+                // If previous move waypoint was spline+terrain_follow
+                // and current is relative or AMSL - throw exception
+                // ARDU doesn't support this WP sequence and will switch to RTL
+                // during flight
+                if (prev_cmd_move_spline_rangefinder && !is_terrain_following) {
+                    VSM_EXCEPTION(Invalid_param_exception, "ARDUPILOT does not support switching to AGL/AMSL altitude"
+                                                           " mode right after spline waypoint with Rangefinder altitude"
+                                                           " mode!");
+
+
+                }
+                // If previous move waypoint was spline+AMSL\AGL
+                // and current is terrain_follow - throw exception
+                // ARDU doesn't support this WP sequence and will switch to RTL
+                // during flight
+                if (prev_cmd_move_spline_relative_amsl && is_terrain_following) {
+                    VSM_EXCEPTION(Invalid_param_exception, "ARDUPILOT does not support switching to Rangefinder "
+                                                           "altitude mode right after spline waypoint with AGL/AMSL"
+                                                           " altitude mode!");
+                }
+
+                // update prev_cmd_move_spline_rangefinder and prev_cmd_move_spline_relative_amsl
+                // values
+                prev_cmd_move_spline_rangefinder = false;
+                prev_cmd_move_spline_relative_amsl = false;
+                int tt;
+                if (params.Get_value("turn_type", tt)) {
+                    prev_cmd_move_spline_rangefinder = ((tt == proto::TURN_TYPE_SPLINE) && is_terrain_following);
+                    prev_cmd_move_spline_relative_amsl = ((tt == proto::TURN_TYPE_SPLINE) && !is_terrain_following);
+                }
+            }
+
             if (cmd == vehicle.c_set_home) {
                 if (takeoff_present) {
                     VSM_EXCEPTION(Invalid_param_exception, "SET_HOME must appear before any WP");
@@ -2783,8 +2867,10 @@ Ardupilot_vehicle::Task_upload::Fill_mavlink_mission_item_common(
     }
 
 
-    /* APM firmware treats all altitudes as relative. Always. */
-    msg->frame = mavlink::MAV_FRAME::MAV_FRAME_GLOBAL_RELATIVE_ALT;
+    /* Override all frames as relative except Terrain  */
+    if (msg->frame != mavlink::MAV_FRAME::MAV_FRAME_GLOBAL_TERRAIN_ALT) {
+        msg->frame = mavlink::MAV_FRAME::MAV_FRAME_GLOBAL_RELATIVE_ALT;
+    }
     msg->current = 0;
     msg->autocontinue = 1;
 }
@@ -3239,6 +3325,8 @@ Ardupilot_vehicle::Task_upload::Prepare_move(const Property_list& params, bool i
         }
     }
 
+    Handle_terrain_following(*mi, params);
+
     Add_mission_item(mi);
     last_move_params = params;
 
@@ -3268,6 +3356,10 @@ Ardupilot_vehicle::Task_upload::Prepare_wait(const Property_list& params)
             } else {
                 (*wp)->command = mavlink::MAV_CMD::MAV_CMD_NAV_LOITER_TIME;
             }
+
+            // add terrain following frame based on previous move
+            Handle_terrain_following(*wp, *last_move_params);
+
             break;
         case proto::VEHICLE_TYPE_FIXED_WING:
         case proto::VEHICLE_TYPE_VTOL:
@@ -3810,6 +3902,34 @@ Ardupilot_vehicle::Task_upload::Build_wp_mission_item(const Property_list& param
     }
     return mi;
 }
+
+
+void
+Ardupilot_vehicle::Task_upload::Handle_terrain_following(ugcs::vsm::mavlink::Pld_mission_item& mi,
+                                                         const ugcs::vsm::Property_list& params)
+{
+    bool use_terrain_following = false;
+    params.Get_value("follow_terrain", use_terrain_following);
+    if (use_terrain_following) {
+        // for terrain_following alt above ground is calculated as
+        // altitude_amsl - ground_elevation
+        double param_ground_elevation;
+        double param_altitude_amsl;
+        if (params.Get_value("ground_elevation", param_ground_elevation) &&
+            params.Get_value("altitude_amsl", param_altitude_amsl)) {
+            mi->z = param_altitude_amsl - param_ground_elevation;
+            mi->frame = mavlink::MAV_FRAME_GLOBAL_TERRAIN_ALT;
+            VEHICLE_LOG_INF(vehicle, "Using TF for WP. Altitude = %f", static_cast<float>(mi->z));
+            if (mi->z <= 0) {
+                VSM_EXCEPTION(Invalid_param_exception, "Desired TF altitude is negative (%f m)!", static_cast<float>(mi->z));
+            }
+        } else {
+            // parameters error
+            VSM_EXCEPTION(Invalid_param_exception, "Cannot calculate TF altitude. One of parameters (ground_elevation, altitude_amsl) was not set.");
+        }
+    }
+}
+
 
 void
 Ardupilot_vehicle::Process_heartbeat(

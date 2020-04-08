@@ -226,7 +226,7 @@ public:
         Process_disarm();
 
         void
-        Process_pause();
+        Process_pause(const ugcs::vsm::Property_list& params);
 
         void
         Process_resume();
@@ -395,6 +395,13 @@ public:
                 float speed = 0.0,
                 bool absolute_angle = true,
                 bool clockwise = true);
+
+        /** Add proper frame and Z-coordinate to WP
+         * based on follow_terrain parameter in Property_list
+         */
+        void
+        Handle_terrain_following(ugcs::vsm::mavlink::Pld_mission_item& mi,
+                                 const ugcs::vsm::Property_list& params);
 
         void
         Stop_camera_series();
