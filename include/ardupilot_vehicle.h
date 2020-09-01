@@ -305,6 +305,10 @@ public:
 
         void
         Process_payload_command(PayloadSubsystem &payload_subsystem, const ugcs::vsm::Property_list& params);
+
+        void
+        Process_direct_mount_control(const ugcs::vsm::Property_list& params);
+
     } vehicle_command;
 
 
@@ -568,10 +572,37 @@ public:
         ugcs::vsm::mavlink::apm::Extension>::Ptr);
 
     void
+    On_rpm(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::RPM,
+            ugcs::vsm::mavlink::apm::Extension>::Ptr);
+
+    void
+    On_battery2(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::BATTERY2,
+            ugcs::vsm::mavlink::apm::Extension>::Ptr);
+
+    void
+    On_power_status(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::POWER_STATUS>::Ptr);
+
+    void
     On_adsb_vehicle(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::ADSB_VEHICLE>::Ptr);
 
     void
     On_v2_extension(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::V2_EXTENSION>::Ptr);
+
+    void
+    On_data16(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::DATA16,
+            ugcs::vsm::mavlink::apm::Extension>::Ptr);
+
+    void
+    On_data32(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::DATA32,
+            ugcs::vsm::mavlink::apm::Extension>::Ptr);
+
+    void
+    On_data64(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::DATA64,
+            ugcs::vsm::mavlink::apm::Extension>::Ptr);
+
+    void
+    On_data96(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::DATA96,
+            ugcs::vsm::mavlink::apm::Extension>::Ptr);
 
     void
     On_string_parameter(
@@ -751,6 +782,28 @@ private:
     /** Time to hold camera servo at the specified PWM when triggering. */
     float camera_servo_time = -1;
 
+    /** Time to wait after camera trigger to avoid bluring photos. Camera shot is not instant, so copter may start turning while diaphragm is open*/
+    float panorama_post_trigger_delay = -1;
+
+    /** Constrains taken from autopilot parameters */
+    struct Mount_Constraints {
+        /** MNT_ANGMAX_PAN */
+        float mount_max_pan = 18000;
+        /** MNT_ANGMAX_ROL */
+        float mount_min_pan = -18000;
+        /** MNT_ANGMAX_TIL */
+        float mount_max_tilt = 18000;
+        /** MNT_ANGMIN_PAN */
+        float mount_min_tilt = -18000;
+        /** MNT_ANGMAX_ROL */
+        float mount_max_roll = 18000;
+        /** MNT_ANGMIN_ROL */
+        float mount_min_roll = -18000;
+    } mount_constraints;
+
+    /** check for correct mount configuration, if ok, then control from ugcs will work */
+    bool is_mount_control_enabled = false;
+
     /** By default joystick mode is disabled for planes.
      * Turn on via an entry in conf file. */
     bool enable_joystick_control_for_fixed_wing = false;
@@ -876,6 +929,13 @@ private:
     std::unordered_map<std::string, ugcs::vsm::Property::Ptr> adsb_parameter_map;
     std::unordered_map<std::string, ugcs::vsm::Property::Ptr> adsb_string_parameter_map;
 
+    ugcs::vsm::Property::Ptr t_battery2_voltage = nullptr;
+    ugcs::vsm::Property::Ptr t_battery2_current = nullptr;
+    ugcs::vsm::Property::Ptr t_rpm1 = nullptr;
+    ugcs::vsm::Property::Ptr t_rail_voltage = nullptr;
+    ugcs::vsm::Property::Ptr t_rail_servo_voltage = nullptr;
+
+
     bool is_airborne = false;
 
     // Workaround the bug in ardupilot which ignores MAV_CMD_CONDITION_YAW command if there is no
@@ -927,6 +987,8 @@ private:
 
     ugcs::vsm::mavlink::Payload_base::Ptr
     Prepare_v2_custom_payload_message(const std::vector<uint8_t>& commandBytes);
+
+    void handle_custom_payload(size_t length, ugcs::vsm::mavlink::Uint8 *array);
 };
 
 #endif /* _ARDUPILOT_VEHICLE_H_ */

@@ -111,6 +111,31 @@ Ardupilot_vehicle::On_enable()
             &Ardupilot_vehicle::On_v2_extension,
             this,
             custom_payload.component_id, custom_payload.system_id);
+
+        common_handlers.Register_mavlink_handler<mavlink::apm::MESSAGE_ID::DATA16,
+                ugcs::vsm::mavlink::apm::Extension>(
+                &Ardupilot_vehicle::On_data16,
+                this,
+                custom_payload.component_id, custom_payload.system_id);
+
+        common_handlers.Register_mavlink_handler<mavlink::apm::MESSAGE_ID::DATA32,
+                ugcs::vsm::mavlink::apm::Extension>(
+                &Ardupilot_vehicle::On_data32,
+                this,
+                custom_payload.component_id, custom_payload.system_id);
+
+        common_handlers.Register_mavlink_handler<mavlink::apm::MESSAGE_ID::DATA64,
+                ugcs::vsm::mavlink::apm::Extension>(
+                &Ardupilot_vehicle::On_data64,
+                this,
+                custom_payload.component_id, custom_payload.system_id);
+
+        common_handlers.Register_mavlink_handler<mavlink::apm::MESSAGE_ID::DATA96,
+                ugcs::vsm::mavlink::apm::Extension>(
+                &Ardupilot_vehicle::On_data96,
+                this,
+                custom_payload.component_id, custom_payload.system_id);
+
     }
 
     common_handlers.Register_mavlink_handler<mavlink::sph::MESSAGE_ID::PARAM_STR_VALUE, mavlink::sph::Extension>(
@@ -161,6 +186,26 @@ Ardupilot_vehicle::On_enable()
 
     c_set_poi->Set_available();
     c_set_poi->Set_enabled();
+
+#define ADD_T(x, y) t_##x = flight_controller->Add_telemetry(#x, y)
+    ADD_T(battery2_voltage, proto::FIELD_SEMANTIC_VOLTAGE);
+    ADD_T(battery2_current, proto::FIELD_SEMANTIC_CURRENT);
+    ADD_T(rpm1, proto::FIELD_SEMANTIC_NUMERIC);
+    ADD_T(rail_voltage, proto::FIELD_SEMANTIC_VOLTAGE);
+    ADD_T(rail_servo_voltage, proto::FIELD_SEMANTIC_VOLTAGE);
+#undef ADD_T
+
+    common_handlers.Register_mavlink_handler<mavlink::apm::MESSAGE_ID::RPM, mavlink::apm::Extension>(
+            &Ardupilot_vehicle::On_rpm,
+            this);
+
+    common_handlers.Register_mavlink_handler<mavlink::apm::MESSAGE_ID::BATTERY2, mavlink::apm::Extension>(
+            &Ardupilot_vehicle::On_battery2,
+            this);
+
+    common_handlers.Register_mavlink_handler<mavlink::MESSAGE_ID::POWER_STATUS>(
+            &Ardupilot_vehicle::On_power_status,
+            this);
 
 #define ADD_T(x, y) t_##x = adsb_transponder->Add_telemetry(#x, y)
     ADD_T(adsb_altitude_internal, proto::FIELD_SEMANTIC_BOOL);
@@ -496,6 +541,14 @@ Ardupilot_vehicle::On_autopilot_version(mavlink::Pld_autopilot_version ver)
         VEHICLE_LOG_DBG(*this, "Enabled MAVLINK2");
     }
 
+    names.emplace("MNT_ANGMAX_PAN");
+    names.emplace("MNT_ANGMAX_ROL");
+    names.emplace("MNT_ANGMAX_TIL");
+    names.emplace("MNT_ANGMIN_PAN");
+    names.emplace("MNT_ANGMIN_ROL");
+    names.emplace("MNT_ANGMIN_TIL");
+    names.emplace("MNT_DEFLT_MODE");
+
     read_parameters.Enable(std::move(names));
 
     /* Disable HOME_POSITION support because SITL does not report it if connected via UDP.
@@ -531,6 +584,31 @@ Ardupilot_vehicle::On_rangefinder(
         t_altitude_agl->Set_value(message->payload->distance.Get());
         Commit_to_ucs();
     }
+}
+
+void
+Ardupilot_vehicle::On_rpm(
+        mavlink::Message<mavlink::apm::MESSAGE_ID::RPM, mavlink::apm::Extension>::Ptr message)
+{
+    t_rpm1->Set_value(message->payload->rpm1.Get());
+    Commit_to_ucs();
+}
+
+void
+Ardupilot_vehicle::On_battery2(
+        mavlink::Message<mavlink::apm::MESSAGE_ID::BATTERY2, mavlink::apm::Extension>::Ptr message)
+{
+    t_battery2_voltage->Set_value(message->payload->voltage.Get() / 1000.0);
+    t_battery2_current->Set_value(message->payload->current_battery.Get() / 100.0);
+    Commit_to_ucs();
+}
+
+void
+Ardupilot_vehicle::On_power_status(ugcs::vsm::mavlink::Message<mavlink::MESSAGE_ID::POWER_STATUS>::Ptr message)
+{
+    t_rail_voltage->Set_value(message->payload->Vcc.Get() / 1000.0);
+    t_rail_servo_voltage->Set_value(message->payload->Vservo.Get() / 1000.0);
+    Commit_to_ucs();
 }
 
 void
@@ -574,6 +652,21 @@ Ardupilot_vehicle::On_parameter(
         memcpy(&id, &f, sizeof(id));
         VEHICLE_LOG_INF((*this), "Got mission hash=%08X", id);
         t_current_mission_id->Set_value(id);
+    } else if (name == "MNT_ANGMAX_PAN") {
+        mount_constraints.mount_max_pan =  m->payload->param_value.Get();
+    } else if (name == "MNT_ANGMAX_ROL") {
+        mount_constraints.mount_max_roll =  m->payload->param_value.Get();
+    } else if (name == "MNT_ANGMAX_TIL") {
+        mount_constraints.mount_max_tilt =  m->payload->param_value.Get();
+    } else if (name == "MNT_ANGMIN_PAN") {
+        mount_constraints.mount_min_pan =  m->payload->param_value.Get();
+    } else if (name == "MNT_ANGMIN_ROL") {
+        mount_constraints.mount_min_roll =  m->payload->param_value.Get();
+    } else if (name == "MNT_ANGMIN_TIL") {
+        mount_constraints.mount_min_tilt =  m->payload->param_value.Get();
+    } else if (name == "MNT_DEFLT_MODE") {
+        is_mount_control_enabled =
+                m->payload->param_value.Get() == mavlink::MAV_MOUNT_MODE::MAV_MOUNT_MODE_MAVLINK_TARGETING;
     }
     Commit_to_ucs();
 }
@@ -601,6 +694,8 @@ Ardupilot_vehicle::On_adsb_vehicle(
     if (ret.second) {
         // Create vehicle if there is not one with this ICAO already.
         vehicle = Adsb_aircraft::Create(icao);
+        vehicle->Enable();
+
         // Tell server that ADSB receiver has discovered new aircraft.
         vehicle->Register();
         LOG("New ADSB aircraft %06X registered", icao);
@@ -630,7 +725,14 @@ Ardupilot_vehicle::On_v2_extension(
         return;
     }
 
-    auto begin = &contents[1];
+    handle_custom_payload(contents[0], &(contents[1]));
+}
+
+void
+Ardupilot_vehicle::handle_custom_payload(size_t length, ugcs::vsm::mavlink::Uint8 *begin)
+{
+    using namespace Protocol::Modern;
+
     PayloadByteArray payload(begin, begin + length);
 
     Onboard::OnboardMessage onboardMessage(payload);
@@ -665,8 +767,63 @@ Ardupilot_vehicle::On_v2_extension(
 
         Commit_to_ucs();
     });
-
 }
+
+void
+Ardupilot_vehicle::On_data16(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::DATA16,
+        ugcs::vsm::mavlink::apm::Extension>::Ptr message){
+    
+    if (message->payload->len > sizeof(message->payload->data)) {
+        // Ignore messages with invalid length
+        return;
+    }
+    if (message->payload->type == CUSTOM_PAYLOAD_DATA_TYPE) {
+        handle_custom_payload( message->payload->len, &(message->payload->data[0]));
+    }
+}
+
+void
+Ardupilot_vehicle::On_data32(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::DATA32,
+        ugcs::vsm::mavlink::apm::Extension>::Ptr message) {
+
+    if (message->payload->len > sizeof(message->payload->data)) {
+        // Ignore messages with invalid length
+        LOG_WARN("Invalid length in DATA32 message");
+        return;
+    }
+    if (message->payload->type == CUSTOM_PAYLOAD_DATA_TYPE) {
+        handle_custom_payload( message->payload->len, &(message->payload->data[0]));
+    }
+}
+
+void
+Ardupilot_vehicle::On_data64(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::DATA64,
+        ugcs::vsm::mavlink::apm::Extension>::Ptr message) {
+
+    if (message->payload->len > sizeof(message->payload->data)) {
+        // Ignore messages with invalid length
+        LOG_WARN("Invalid length in DATA64 message");
+        return;
+    }
+    if (message->payload->type == CUSTOM_PAYLOAD_DATA_TYPE) {
+        handle_custom_payload( message->payload->len, &(message->payload->data[0]));
+    }
+}
+
+void
+Ardupilot_vehicle::On_data96(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::DATA96,
+        ugcs::vsm::mavlink::apm::Extension>::Ptr message) {
+
+    if (message->payload->len > sizeof(message->payload->data)) {
+        // Ignore messages with invalid length
+        LOG_WARN("Invalid length in DATA96 message");
+        return;
+    }
+    if (message->payload->type == CUSTOM_PAYLOAD_DATA_TYPE) {
+        handle_custom_payload( message->payload->len, &(message->payload->data[0]));
+    }
+}
+
 
 void
 Ardupilot_vehicle::On_mission_item(ugcs::vsm::mavlink::Pld_mission_item mi)
@@ -727,12 +884,12 @@ Ardupilot_vehicle::Report_home_location(double lat, double lon, double alt)
 
     if (Is_home_position_valid()) {
         VEHICLE_LOG_INF(*this,
-            "Got home position: x=%f, y=%f, z=%f.",
+            "Got home position: x=%f, y=%f, z=%f. Setting altitude origin.",
             lat * 180 / M_PI, lon * 180 / M_PI, alt);
         t_home_latitude->Set_value(lat);
         t_home_longitude->Set_value(lon);
         t_home_altitude_amsl->Set_value(alt);
-        //Set_altitude_origin(alt);   // this calls Commit_to_ucs.
+        Set_altitude_origin(alt);   // this calls Commit_to_ucs.
     }
 }
 
@@ -800,7 +957,7 @@ Ardupilot_vehicle::Vehicle_command_act::Try()
         VEHICLE_LOG_DBG(vehicle, "Sending to vehicle: %s", (*(cmd_messages.front())).Dump().c_str());
         if (cmd->Get_id() == mavlink::apm::MESSAGE_ID::FENCE_POINT) {
             Schedule_verify_timer();
-        } else if (cmd->Get_id() == mavlink::MESSAGE_ID::SET_POSITION_TARGET_LOCAL_NED) {
+        } else if (cmd->Get_id() == mavlink::MESSAGE_ID::SET_POSITION_TARGET_LOCAL_NED || cmd->Get_id() == mavlink::apm::MESSAGE_ID::MOUNT_CONTROL) {
             // there will be no ack from this cmd so jump to next cmd
             Send_next_command();
         } else {
@@ -1049,6 +1206,32 @@ Ardupilot_vehicle::Vehicle_command_act::Process_payload_command(PayloadSubsystem
     } else {
         VSM_EXCEPTION(Invalid_param_exception, "Unsupported payload command");
     }
+}
+
+void Ardupilot_vehicle::Vehicle_command_act::Process_direct_mount_control(const ugcs::vsm::Property_list &params) {
+    if (!ardu_vehicle.is_mount_control_enabled ) {
+        Disable("Direct Mount control failed. MNT_DEFLT_MODE must be set to 2");
+        return;
+    }
+
+    auto mc = mavlink::apm::Pld_mount_control::Create();
+    Fill_target_system_id(*mc);
+
+    float tmp;
+    params.Get_value("pitch", tmp);
+    // Convert range (-1, 1) to (MIN, MAX)
+    (*mc)->input_a = static_cast<int>(ardu_vehicle.mount_constraints.mount_min_tilt * (1 - tmp) / 2
+            + ardu_vehicle.mount_constraints.mount_max_tilt * (tmp + 1) / 2); // Scale?
+
+    params.Get_value("roll", tmp);
+    (*mc)->input_b = static_cast<int> (ardu_vehicle.mount_constraints.mount_min_roll * (1 - tmp) / 2
+                                       + ardu_vehicle.mount_constraints.mount_max_roll * (tmp + 1) / 2);
+
+    params.Get_value("yaw", tmp);
+    (*mc)->input_c = static_cast<int>(ardu_vehicle.mount_constraints.mount_min_pan * (1 - tmp) / 2
+                                      + ardu_vehicle.mount_constraints.mount_max_pan * (tmp + 1) / 2);
+
+    cmd_messages.emplace_back(mc);
 }
 
 void
@@ -1372,6 +1555,8 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
                     return cmd == payload_subsystem->c_payload_command;
                 })) != std::end(ardu_vehicle.payload_subsystems)) {
             Process_payload_command(**it, params);
+        } else if (cmd == vehicle.c_direct_payload_control) {
+            Process_direct_mount_control(params);
         }
     }
     command_count = cmd_messages.size();
@@ -2074,7 +2259,7 @@ Ardupilot_vehicle::Vehicle_command_act::Process_waypoint(const Property_list& pa
         auto cmd_long = mavlink::Pld_command_long::Create();
         Fill_target_ids(*cmd_long);
         (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_DO_CHANGE_SPEED;
-        (*cmd_long)->param1 = speed;
+        (*cmd_long)->param1 = 0; // airspeed
         (*cmd_long)->param2 = speed;
         cmd_messages.emplace_back(cmd_long);
 
@@ -3491,12 +3676,11 @@ Ardupilot_vehicle::Task_upload::Prepare_change_speed(const Property_list& params
     case proto::VEHICLE_TYPE_MULTICOPTER:
     case proto::VEHICLE_TYPE_HELICOPTER:
         /* ArduCopter version up to 3.2 use p1 for speed and ignores p2.
+         * Starting from 3.7 we do not support 3.2
          * ArduCopter version up to 3.2+ use p2 for speed and ignores p1.
-         * So, we set both, here.
-         * Later, if MAV_CMD_DO_CHANGE_SPEED handling changes
-         * in ArduPilot we will need to implement FW version checking.
+         * ArduCopter version up to 4.0+ it is mandatory to setup first param correct.
          */
-        (*mi)->param1 = current_speed;
+        (*mi)->param1 = 0; /* Airspeed. */
         (*mi)->param2 = current_speed;
         break;
     default:
@@ -3780,6 +3964,14 @@ Ardupilot_vehicle::Task_upload::Prepare_panorama(const Property_list& params)
 
             // Set off trigger
             Add_camera_trigger_item();
+
+            if (ardu_vehicle.panorama_post_trigger_delay > 0) {
+                // Camera trigger is not instant, hence we wait a bit before engaging turn action
+                waiter = Build_wp_mission_item(*last_move_params);
+                (*waiter)->command = mavlink::MAV_CMD::MAV_CMD_NAV_LOITER_TIME;
+                (*waiter)->param1 = ardu_vehicle.panorama_post_trigger_delay; /* seconds. */
+                Add_mission_item(waiter);
+            }
         }
         cur_angle += cur_step_angle;
     }
@@ -4333,6 +4525,14 @@ Ardupilot_vehicle::Configure_real_vehicle()
                 VEHICLE_LOG_INF((*this), "Route download is disabled.");
             }
         }
+    }
+
+    if (props->Exists("vehicle.ardupilot.panorama_post_trigger_delay")) {
+        panorama_post_trigger_delay = props->Get_int("vehicle.ardupilot.panorama_post_trigger_delay");
+        VEHICLE_LOG_INF((*this), "Panorama post trigger set to %f.", panorama_post_trigger_delay);
+    } else {
+        panorama_post_trigger_delay = 0;
+        VEHICLE_LOG_INF((*this), "No Panorama post trigger delay specified.");
     }
 }
 

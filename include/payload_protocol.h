@@ -18,6 +18,9 @@
 #include <algorithm>
 #include <memory>
 
+/** This value used to identify custom payload data from telemetry messages. */
+#define CUSTOM_PAYLOAD_DATA_TYPE 0xAF
+
 namespace Protocol {
 namespace Modern {
 
