@@ -50,7 +50,6 @@ Ardupilot_vehicle::On_enable()
 
     Configure_real_vehicle();
 
-    c_mission_clear = flight_controller->Add_command("mission_clear", false);
     c_mission_clear->Set_available();
 
     // Get parameter values.
